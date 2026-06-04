@@ -281,6 +281,13 @@ function formatValidationPath(error: TLocalizedValidationError): string {
   return path || "root";
 }
 
+function createToolSchemaValidationError(toolName: string, error: unknown): Error {
+  const detail = error instanceof Error && error.message ? `: ${error.message}` : "";
+  return new Error(
+    `Validation failed for tool "${toolName}":\n  - parameters: schema could not be read or compiled${detail}`,
+  );
+}
+
 /** Finds the target tool and validates/coerces a model-emitted tool call. */
 export function validateToolCall(tools: Tool[], toolCall: ToolCall): unknown {
   const tool = tools.find((t) => t.name === toolCall.name);
@@ -293,34 +300,50 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): unknown {
 /** Validates tool arguments against TypeBox or plain JSON-schema parameters. */
 export function validateToolArguments(tool: Tool, toolCall: ToolCall): unknown {
   const args = structuredClone(toolCall.arguments);
-  Value.Convert(tool.parameters, args);
+  let parameters: Tool["parameters"];
+  let validator: ReturnType<typeof Compile>;
+  try {
+    parameters = tool.parameters;
+    Value.Convert(parameters, args);
 
-  const validator = getValidator(tool.parameters);
-  if (!hasTypeBoxMetadata(tool.parameters) && isJsonSchemaObject(tool.parameters)) {
-    // TypeBox Value.Convert is intentionally conservative for plain JSON schemas;
-    // mirror the provider-facing coercions so model-emitted string numbers validate.
-    const coerced = coerceWithJsonSchema(args, tool.parameters);
-    if (coerced !== args) {
-      if (isRecord(args) && isRecord(coerced)) {
-        for (const key of Object.keys(args)) {
-          delete args[key];
+    validator = getValidator(parameters);
+    if (!hasTypeBoxMetadata(parameters) && isJsonSchemaObject(parameters)) {
+      // TypeBox Value.Convert is intentionally conservative for plain JSON schemas;
+      // mirror the provider-facing coercions so model-emitted string numbers validate.
+      const coerced = coerceWithJsonSchema(args, parameters);
+      if (coerced !== args) {
+        if (isRecord(args) && isRecord(coerced)) {
+          for (const key of Object.keys(args)) {
+            delete args[key];
+          }
+          Object.assign(args, coerced);
+        } else {
+          return validator.Check(coerced) ? coerced : args;
         }
-        Object.assign(args, coerced);
-      } else {
-        return validator.Check(coerced) ? coerced : args;
       }
     }
+  } catch (error) {
+    throw createToolSchemaValidationError(toolCall.name, error);
   }
 
-  if (validator.Check(args)) {
-    return args;
+  try {
+    if (validator.Check(args)) {
+      return args;
+    }
+  } catch (error) {
+    throw createToolSchemaValidationError(toolCall.name, error);
   }
 
-  const errors =
-    validator
-      .Errors(args)
-      .map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
-      .join("\n") || "Unknown validation error";
+  let errors: string;
+  try {
+    errors =
+      validator
+        .Errors(args)
+        .map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
+        .join("\n") || "Unknown validation error";
+  } catch (error) {
+    throw createToolSchemaValidationError(toolCall.name, error);
+  }
 
   throw new Error(
     `Validation failed for tool "${toolCall.name}":\n${errors}\n\nReceived arguments:\n${JSON.stringify(toolCall.arguments, null, 2)}`,
